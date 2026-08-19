@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "db/io_stats.h"
 #include "leveldb/comparator.h"
 #include "table/format.h"
 #include "util/coding.h"
@@ -39,7 +40,15 @@ Block::Block(const BlockContents& contents)
   }
 }
 
+void Block::AccountCompactionDataBlock() {
+  ws_counted_ = true;
+  g_data_block_ws.Acquire(size_);
+}
+
 Block::~Block() {
+  if (ws_counted_) {
+    g_data_block_ws.Release(size_);
+  }
   if (owned_) {
     delete[] data_;
   }

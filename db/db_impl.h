@@ -6,13 +6,16 @@
 #define STORAGE_LEVELDB_DB_DB_IMPL_H_
 
 #include <atomic>
+#include <cstdio>
 #include <deque>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "db/dbformat.h"
 #include "db/log_writer.h"
 #include "db/snapshot.h"
+#include "db/wal_snapshot_trigger.h"
 #include "leveldb/db.h"
 #include "leveldb/env.h"
 #include "port/port.h"
@@ -25,6 +28,9 @@ class TableCache;
 class Version;
 class VersionEdit;
 class VersionSet;
+class PreL0Manager;
+class TwinEnv;
+class LatencyInjector;
 
 class DBImpl : public DB {
  public:
@@ -66,6 +72,15 @@ class DBImpl : public DB {
   // file at a level >= 1.
   int64_t TEST_MaxNextLevelOverlappingBytes();
 
+  uint64_t TEST_PreL0LinkValueBytes();
+
+  Status TEST_TriggerWalSnapshot();
+
+  uint64_t TEST_LiveWalBytes();
+  uint64_t TEST_WalSnapshotCount();
+
+  uint64_t TEST_PreL0MinLogNumber();
+
   // Record a sample of bytes read at the specified internal key.
   // Samples are taken approximately once every config::kReadBytesPeriod
   // bytes.
@@ -101,6 +116,52 @@ class DBImpl : public DB {
     int64_t bytes_written;
   };
 
+  struct FlushHotnessMetrics {
+    uint64_t timestamp_us;
+    uint64_t flush_seq;
+    uint64_t total_entries;
+    uint64_t unique_keys;
+    uint64_t hot_keys;
+    double hot_key_ratio;
+    double hot_byte_ratio;
+    int max_version_count;
+    int p50_version_count;
+    int p90_version_count;
+  };
+
+  struct FlushOverlapMetrics {
+    uint64_t timestamp_us;
+    int memtable_key_count;
+    int l0_file_count;
+    int bloom_hit_count;
+    double bloom_hit_ratio;
+    std::string new_sst_smallest;
+    std::string new_sst_largest;
+    uint64_t new_sst_size_bytes;
+  };
+
+  struct KeyAccessStats {
+    uint64_t read_count = 0;
+    uint64_t write_count = 0;
+  };
+
+  struct CompactionMetrics {
+    int64_t timestamp_us;
+    int compaction_level;
+    int64_t input_bytes;
+    int64_t output_bytes;
+    int l0_files_before;
+    int l0_files_after;
+    int64_t l0_bytes;
+    int l1_files_before;
+    int l1_files_after;
+    int64_t l1_bytes;
+    int64_t peak_resident_data_block_bytes = 0;
+    int64_t peak_resident_data_block_count = 0;
+    int64_t total_data_block_bytes = 0;
+    int64_t total_data_block_count = 0;
+  };
+
   Iterator* NewInternalIterator(const ReadOptions&,
                                 SequenceNumber* latest_snapshot,
                                 uint32_t* seed);
@@ -124,7 +185,8 @@ class DBImpl : public DB {
   void CompactMemTable() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status RecoverLogFile(uint64_t log_number, bool last_log, bool* save_manifest,
-                        VersionEdit* edit, SequenceNumber* max_sequence)
+                        VersionEdit* edit, SequenceNumber* max_sequence,
+                        uint64_t* records_replayed, int* l0_tables_written)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   Status WriteLevel0Table(MemTable* mem, VersionEdit* edit, Version* base)
@@ -132,8 +194,18 @@ class DBImpl : public DB {
 
   Status MakeRoomForWrite(bool force /* compact even if there is room? */)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status SwitchToNewWAL() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
   WriteBatch* BuildBatchGroup(Writer** last_writer)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void BackgroundWalSnapshot() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  Status WriteWalSnapshotFile(uint64_t snapshot_num, SequenceNumber snap_seq,
+                              Iterator* iter, uint64_t* entries_written);
+  void AddWalBytes(uint64_t wal_number, uint64_t n)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_) {
+    wal_bytes_[wal_number] += n;
+    live_wal_bytes_ += n;
+  }
 
   void RecordBackgroundError(const Status& s);
 
@@ -150,6 +222,27 @@ class DBImpl : public DB {
   Status FinishCompactionOutputFile(CompactionState* compact, Iterator* input);
   Status InstallCompactionResults(CompactionState* compact)
       EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void EnableKeyAccessTracking() override;
+  void DumpKeyAccessStats() EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void LogCompactionMetrics(const CompactionMetrics& m)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void LogFlushHotnessMetrics(const FlushHotnessMetrics& m)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void LogFlushOverlapMetrics(const FlushOverlapMetrics& m)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void LogWalMetrics(uint64_t wal_number, uint64_t create_time_us,
+                     uint64_t delete_time_us, uint64_t wal_size_bytes)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void SnapshotWalFootprint(const std::vector<std::string>& filenames)
+      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+
+  void LogUserWriteBytes(uint64_t batch_bytes) EXCLUSIVE_LOCKS_REQUIRED(mutex_);
 
   const Comparator* user_comparator() const {
     return internal_comparator_.user_comparator();
@@ -177,6 +270,14 @@ class DBImpl : public DB {
   MemTable* mem_;
   MemTable* imm_ GUARDED_BY(mutex_);  // Memtable being compacted
   std::atomic<bool> has_imm_;         // So bg thread can detect non-null imm_
+  PreL0Manager* pre_l0_ GUARDED_BY(mutex_);
+  uint64_t imm_log_number_ GUARDED_BY(mutex_);
+
+  TwinEnv* twin_env_;
+  LatencyInjector* inner_injector_;
+  LatencyInjector* host_read_stream_injector_;
+  LatencyInjector* host_read_random_injector_;
+  LatencyInjector* host_write_injector_;
   WritableFile* logfile_;
   uint64_t logfile_number_ GUARDED_BY(mutex_);
   log::Writer* log_;
@@ -203,6 +304,27 @@ class DBImpl : public DB {
   Status bg_error_ GUARDED_BY(mutex_);
 
   CompactionStats stats_[config::kNumLevels] GUARDED_BY(mutex_);
+  FILE* metrics_file_ GUARDED_BY(mutex_);
+  FILE* flush_hotness_file_ GUARDED_BY(mutex_);
+  uint64_t flush_seq_ GUARDED_BY(mutex_);
+  FILE* flush_metrics_file_ GUARDED_BY(mutex_);
+
+  std::unordered_map<uint64_t, uint64_t> wal_create_times_ GUARDED_BY(mutex_);
+  FILE* wal_metrics_file_ GUARDED_BY(mutex_);
+  FILE* wal_footprint_file_ GUARDED_BY(mutex_);
+
+  std::unordered_map<uint64_t, uint64_t> wal_bytes_ GUARDED_BY(mutex_);
+  uint64_t live_wal_bytes_ GUARDED_BY(mutex_);
+  WalSnapshotTrigger wal_snapshot_trigger_ GUARDED_BY(mutex_);
+  bool wal_snapshot_requested_ GUARDED_BY(mutex_);
+  uint64_t wal_snapshot_count_ GUARDED_BY(mutex_);
+
+  std::unordered_map<std::string, KeyAccessStats> key_access_map_
+      GUARDED_BY(mutex_);
+  FILE* key_access_file_ GUARDED_BY(mutex_);
+
+  uint64_t user_write_bytes_ GUARDED_BY(mutex_);
+  std::string user_write_bytes_path_;
 };
 
 // Sanitize db options.  The caller should delete result.info_log if

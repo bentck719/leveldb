@@ -6,6 +6,8 @@
 #define STORAGE_LEVELDB_INCLUDE_OPTIONS_H_
 
 #include <cstddef>
+#include <cstdint>
+#include <string>
 
 #include "leveldb/export.h"
 
@@ -145,6 +147,38 @@ struct LEVELDB_EXPORT Options {
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
   const FilterPolicy* filter_policy = nullptr;
+
+  std::string metrics_dir;
+
+  bool enable_wal_footprint_tracking = false;
+
+  bool enable_pre_l0 = false;
+
+  size_t pre_l0_cxl_size = 256ULL * 1024 * 1024;
+
+  double pre_l0_cxl_link_bps = 53.5;
+  double pre_l0_cxl_link_fixed_ns = 57.0;
+  double pre_l0_inner_bps = 51.2;
+  double pre_l0_inner_fixed_ns = 0.0;
+
+  double pre_l0_host_read_bps  = 3.48;
+  double pre_l0_host_write_bps = 2.51;
+  double pre_l0_host_fixed_ns  = 235000.0;
+
+  bool enable_host_model = false;
+
+  int pre_l0_hot_threshold = 1;
+
+  bool enable_cxl_compaction = false;
+
+  bool pre_l0_fallback_to_l0 = true;
+
+  double pre_l0_evict_high_watermark = 0.80;
+  double pre_l0_evict_low_watermark = 0.60;
+
+  uint64_t pre_l0_wal_snapshot_threshold_bytes = 2ULL * 1024 * 1024 * 1024;
+
+  double pre_l0_wal_snapshot_release_ratio = 0.5;
 };
 
 // Options that control read operations

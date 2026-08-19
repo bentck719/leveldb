@@ -6,14 +6,22 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <set>
 #include <string>
 #include <vector>
 
+#include <sys/time.h>
+
 #include "db/builder.h"
 #include "db/db_iter.h"
+#include "db/io_stats.h"
+#include "db/pre_l0/latency_injector.h"
+#include "db/pre_l0/io_context.h"
+#include "db/pre_l0/pre_l0_manager.h"
+#include "db/pre_l0/twin_env.h"
 #include "db/dbformat.h"
 #include "db/filename.h"
 #include "db/log_reader.h"
@@ -147,7 +155,112 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)),
+      metrics_file_(nullptr),
+      flush_hotness_file_(nullptr),
+      flush_seq_(0),
+      flush_metrics_file_(nullptr),
+      wal_metrics_file_(nullptr),
+      wal_footprint_file_(nullptr),
+      live_wal_bytes_(0),
+      wal_snapshot_trigger_(options_.pre_l0_wal_snapshot_threshold_bytes,
+                            options_.pre_l0_wal_snapshot_release_ratio),
+      wal_snapshot_requested_(false),
+      wal_snapshot_count_(0),
+      key_access_file_(nullptr),
+      pre_l0_(nullptr),
+      imm_log_number_(0),
+      twin_env_(nullptr),
+      inner_injector_(nullptr),
+      host_read_stream_injector_(nullptr),
+      host_read_random_injector_(nullptr),
+      host_write_injector_(nullptr),
+      user_write_bytes_(0) {
+  if (!options_.metrics_dir.empty()) {
+    const std::string& dir = options_.metrics_dir;
+    metrics_file_ = std::fopen((dir + "/compaction_metrics.csv").c_str(), "a");
+    if (metrics_file_ == nullptr) {
+      std::fprintf(stderr,
+                   "LevelDB warning: failed to open compaction_metrics.csv\n");
+    } else {
+      std::fseek(metrics_file_, 0, SEEK_END);
+      if (std::ftell(metrics_file_) == 0) {
+        std::fprintf(metrics_file_,
+                     "timestamp_us,compaction_level,input_bytes,output_bytes,"
+                     "l0_files_before,l0_files_after,l0_bytes,"
+                     "l1_files_before,l1_files_after,l1_bytes,"
+                     "peak_resident_data_block_bytes,"
+                     "peak_resident_data_block_count,"
+                     "total_data_block_bytes,total_data_block_count\n");
+      }
+    }
+    flush_hotness_file_ =
+        std::fopen((dir + "/flush_hotness.csv").c_str(), "a");
+    if (flush_hotness_file_ == nullptr) {
+      std::fprintf(stderr,
+                   "LevelDB warning: failed to open flush_hotness.csv\n");
+    } else {
+      std::fseek(flush_hotness_file_, 0, SEEK_END);
+      if (std::ftell(flush_hotness_file_) == 0) {
+        std::fprintf(flush_hotness_file_,
+                     "timestamp_us,flush_seq,total_entries,unique_keys,"
+                     "hot_keys,hot_key_ratio,hot_byte_ratio,"
+                     "max_version_count,p50_version_count,"
+                     "p90_version_count\n");
+      }
+    }
+    flush_metrics_file_ =
+        std::fopen((dir + "/flush_metrics.csv").c_str(), "a");
+    if (flush_metrics_file_ == nullptr) {
+      std::fprintf(stderr,
+                   "LevelDB warning: failed to open flush_metrics.csv\n");
+    } else {
+      std::fseek(flush_metrics_file_, 0, SEEK_END);
+      if (std::ftell(flush_metrics_file_) == 0) {
+        std::fprintf(flush_metrics_file_,
+                     "timestamp_us,memtable_key_count,l0_file_count,"
+                     "bloom_hit_count,bloom_hit_ratio,"
+                     "new_sst_smallest,new_sst_largest,new_sst_size_bytes\n");
+      }
+    }
+    wal_metrics_file_ = std::fopen((dir + "/wal_metrics.csv").c_str(), "a");
+    if (wal_metrics_file_ == nullptr) {
+      std::fprintf(stderr,
+                   "LevelDB warning: failed to open wal_metrics.csv\n");
+    } else {
+      std::fseek(wal_metrics_file_, 0, SEEK_END);
+      if (std::ftell(wal_metrics_file_) == 0) {
+        std::fprintf(wal_metrics_file_,
+                     "wal_number,create_time_us,delete_time_us,"
+                     "lifetime_ms,wal_size_bytes\n");
+      }
+    }
+    if (options_.enable_wal_footprint_tracking) {
+      wal_footprint_file_ =
+          std::fopen((dir + "/wal_footprint.csv").c_str(), "a");
+      if (wal_footprint_file_ == nullptr) {
+        std::fprintf(stderr,
+                     "LevelDB warning: failed to open wal_footprint.csv\n");
+      } else {
+        std::fseek(wal_footprint_file_, 0, SEEK_END);
+        if (std::ftell(wal_footprint_file_) == 0) {
+          std::fprintf(wal_footprint_file_,
+                       "timestamp_us,retained_wal_count,retained_wal_bytes,"
+                       "oldest_retained_log,newest_log,log_gap\n");
+        }
+      }
+    }
+    key_access_file_ = std::fopen((dir + "/key_access.csv").c_str(), "w");
+    if (key_access_file_ == nullptr) {
+      std::fprintf(stderr,
+                   "LevelDB warning: failed to open key_access.csv\n");
+    } else {
+      std::fprintf(key_access_file_,
+                   "key,read_count,write_count,total_count\n");
+    }
+    user_write_bytes_path_ = dir + "/user_write_bytes.csv";
+  }
+}
 
 DBImpl::~DBImpl() {
   // Wait for background work to finish.
@@ -158,10 +271,49 @@ DBImpl::~DBImpl() {
   }
   mutex_.Unlock();
 
+  if (metrics_file_ != nullptr) {
+    std::fclose(metrics_file_);
+  }
+  if (flush_hotness_file_ != nullptr) {
+    std::fclose(flush_hotness_file_);
+  }
+  if (flush_metrics_file_ != nullptr) {
+    std::fclose(flush_metrics_file_);
+  }
+  if (wal_metrics_file_ != nullptr) {
+    std::fclose(wal_metrics_file_);
+  }
+  if (wal_footprint_file_ != nullptr) {
+    std::fclose(wal_footprint_file_);
+  }
+  if (key_access_file_ != nullptr) {
+    MutexLock l(&mutex_);
+    DumpKeyAccessStats();
+    std::fclose(key_access_file_);
+    key_access_file_ = nullptr;
+  }
+  if (!user_write_bytes_path_.empty()) {
+    FILE* f = std::fopen(user_write_bytes_path_.c_str(), "w");
+    if (f == nullptr) {
+      std::fprintf(stderr,
+                   "LevelDB warning: failed to open user_write_bytes.csv\n");
+    } else {
+      std::fprintf(f, "cumulative_bytes\n");
+      std::fprintf(f, "%llu\n",
+                   static_cast<unsigned long long>(user_write_bytes_));
+      std::fclose(f);
+    }
+  }
+
   if (db_lock_ != nullptr) {
     env_->UnlockFile(db_lock_);
   }
 
+  if (pre_l0_ != nullptr) {
+    pre_l0_->DumpTimers();
+    pre_l0_->DumpStats();
+  }
+  delete pre_l0_;
   delete versions_;
   if (mem_ != nullptr) mem_->Unref();
   if (imm_ != nullptr) imm_->Unref();
@@ -169,6 +321,12 @@ DBImpl::~DBImpl() {
   delete log_;
   delete logfile_;
   delete table_cache_;
+
+  delete twin_env_;
+  delete inner_injector_;
+  delete host_read_stream_injector_;
+  delete host_read_random_injector_;
+  delete host_write_injector_;
 
   if (owns_info_log_) {
     delete options_.info_log;
@@ -279,14 +437,51 @@ void DBImpl::RemoveObsoleteFiles() {
     }
   }
 
+  struct WalDeleteInfo {
+    uint64_t number;
+    uint64_t create_time_us;
+    std::string filename;
+    uint64_t size_bytes;
+  };
+  std::vector<WalDeleteInfo> wal_deletes;
+  for (const std::string& fname : files_to_delete) {
+    uint64_t num;
+    FileType t;
+    if (ParseFileName(fname, &num, &t) && t == kLogFile) {
+      auto it = wal_create_times_.find(num);
+      uint64_t create_time = (it != wal_create_times_.end()) ? it->second : 0;
+      wal_deletes.push_back({num, create_time, fname, 0});
+    }
+  }
+
   // While deleting all files unblock other threads. All files being deleted
   // have unique names which will not collide with newly created files and
   // are therefore safe to delete while allowing other threads to proceed.
   mutex_.Unlock();
+  for (WalDeleteInfo& info : wal_deletes) {
+    env_->GetFileSize(dbname_ + "/" + info.filename, &info.size_bytes);
+  }
   for (const std::string& filename : files_to_delete) {
     env_->RemoveFile(dbname_ + "/" + filename);
   }
   mutex_.Lock();
+
+  uint64_t delete_time_us = env_->NowMicros();
+  for (const WalDeleteInfo& info : wal_deletes) {
+    wal_create_times_.erase(info.number);
+    auto bit = wal_bytes_.find(info.number);
+    if (bit != wal_bytes_.end()) {
+      live_wal_bytes_ =
+          (live_wal_bytes_ >= bit->second) ? live_wal_bytes_ - bit->second : 0;
+      wal_bytes_.erase(bit);
+    }
+    if (info.create_time_us > 0) {
+      LogWalMetrics(info.number, info.create_time_us, delete_time_us,
+                    info.size_bytes);
+    }
+  }
+
+  SnapshotWalFootprint(filenames);
 }
 
 Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
@@ -362,9 +557,21 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
 
   // Recover in the order in which the logs were generated
   std::sort(logs.begin(), logs.end());
+
+  uint64_t retained_wal_bytes = 0;
+  for (size_t i = 0; i < logs.size(); i++) {
+    uint64_t lsize = 0;
+    if (env_->GetFileSize(LogFileName(dbname_, logs[i]), &lsize).ok()) {
+      retained_wal_bytes += lsize;
+    }
+  }
+
+  uint64_t records_replayed = 0;
+  int l0_tables_written = 0;
+  auto replay_start = std::chrono::steady_clock::now();
   for (size_t i = 0; i < logs.size(); i++) {
     s = RecoverLogFile(logs[i], (i == logs.size() - 1), save_manifest, edit,
-                       &max_sequence);
+                       &max_sequence, &records_replayed, &l0_tables_written);
     if (!s.ok()) {
       return s;
     }
@@ -373,6 +580,28 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
     // records after allocating this log number.  So we manually
     // update the file number allocation counter in VersionSet.
     versions_->MarkFileNumberUsed(logs[i]);
+  }
+  auto replay_end = std::chrono::steady_clock::now();
+  double recovery_ms =
+      std::chrono::duration<double, std::milli>(replay_end - replay_start)
+          .count();
+
+  if (!options_.metrics_dir.empty()) {
+    std::string path = options_.metrics_dir + "/recovery.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (f != nullptr) {
+      std::fseek(f, 0, SEEK_END);
+      if (std::ftell(f) == 0) {
+        std::fprintf(f,
+                     "num_logs_replayed,retained_wal_bytes,records_replayed,"
+                     "l0_tables_written,recovery_ms\n");
+      }
+      std::fprintf(f, "%zu,%llu,%llu,%d,%.3f\n", logs.size(),
+                   static_cast<unsigned long long>(retained_wal_bytes),
+                   static_cast<unsigned long long>(records_replayed),
+                   l0_tables_written, recovery_ms);
+      std::fclose(f);
+    }
   }
 
   if (versions_->LastSequence() < max_sequence) {
@@ -384,7 +613,9 @@ Status DBImpl::Recover(VersionEdit* edit, bool* save_manifest) {
 
 Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
                               bool* save_manifest, VersionEdit* edit,
-                              SequenceNumber* max_sequence) {
+                              SequenceNumber* max_sequence,
+                              uint64_t* records_replayed,
+                              int* l0_tables_written) {
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
@@ -430,6 +661,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
   int compactions = 0;
   MemTable* mem = nullptr;
   while (reader.ReadRecord(&record, &scratch) && status.ok()) {
+    (*records_replayed)++;
     if (record.size() < 12) {
       reporter.Corruption(record.size(),
                           Status::Corruption("log record too small"));
@@ -499,6 +731,7 @@ Status DBImpl::RecoverLogFile(uint64_t log_number, bool last_log,
     mem->Unref();
   }
 
+  *l0_tables_written += compactions;
   return status;
 }
 
@@ -512,6 +745,96 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   Iterator* iter = mem->NewIterator();
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long)meta.number);
+
+  if (flush_hotness_file_ != nullptr) {
+    FlushHotnessMetrics fhm;
+    fhm.timestamp_us = env_->NowMicros();
+    fhm.flush_seq = flush_seq_++;
+
+    struct KeyStats { int count; uint64_t bytes; };
+    std::vector<KeyStats> per_key;
+    uint64_t total_entries = 0;
+    uint64_t total_bytes = 0;
+    std::string prev_ukey;
+    int cur_count = 0;
+    uint64_t cur_bytes = 0;
+
+    Iterator* scan = mem->NewIterator();
+    for (scan->SeekToFirst(); scan->Valid(); scan->Next()) {
+      total_entries++;
+      Slice ukey = ExtractUserKey(scan->key());
+      uint64_t ebytes = scan->key().size() + scan->value().size();
+      total_bytes += ebytes;
+      if (ukey.compare(Slice(prev_ukey)) != 0) {
+        if (cur_count > 0) per_key.push_back({cur_count, cur_bytes});
+        prev_ukey = ukey.ToString();
+        cur_count = 1;
+        cur_bytes = ebytes;
+      } else {
+        cur_count++;
+        cur_bytes += ebytes;
+      }
+    }
+    if (cur_count > 0) per_key.push_back({cur_count, cur_bytes});
+    delete scan;
+
+    uint64_t unique_keys = per_key.size();
+    uint64_t hot_keys = 0;
+    uint64_t hot_bytes = 0;
+    int max_vc = 0;
+    std::vector<int> counts;
+    counts.reserve(unique_keys);
+    for (const auto& ks : per_key) {
+      counts.push_back(ks.count);
+      if (ks.count > max_vc) max_vc = ks.count;
+      if (ks.count >= 2) { hot_keys++; hot_bytes += ks.bytes; }
+    }
+    int p50 = 1, p90 = 1;
+    if (!counts.empty()) {
+      std::sort(counts.begin(), counts.end());
+      p50 = counts[(counts.size() - 1) * 50 / 100];
+      p90 = counts[(counts.size() - 1) * 90 / 100];
+    }
+    fhm.total_entries = total_entries;
+    fhm.unique_keys = unique_keys;
+    fhm.hot_keys = hot_keys;
+    fhm.hot_key_ratio = unique_keys > 0
+        ? static_cast<double>(hot_keys) / unique_keys : 0.0;
+    fhm.hot_byte_ratio = total_bytes > 0
+        ? static_cast<double>(hot_bytes) / total_bytes : 0.0;
+    fhm.max_version_count = max_vc;
+    fhm.p50_version_count = p50;
+    fhm.p90_version_count = p90;
+    LogFlushHotnessMetrics(fhm);
+  }
+
+  FlushOverlapMetrics fom;
+  fom.timestamp_us = env_->NowMicros();
+  fom.memtable_key_count = 0;
+  fom.l0_file_count = 0;
+  fom.bloom_hit_count = 0;
+  if (flush_metrics_file_ != nullptr) {
+    const std::vector<FileMetaData*>& l0_files =
+        versions_->current()->GetFiles(0);
+    fom.l0_file_count = static_cast<int>(l0_files.size());
+    if (!l0_files.empty()) {
+      Iterator* mem_iter = mem->NewIterator();
+      for (mem_iter->SeekToFirst(); mem_iter->Valid(); mem_iter->Next()) {
+        fom.memtable_key_count++;
+        Slice user_key = ExtractUserKey(mem_iter->key());
+        for (const FileMetaData* f : l0_files) {
+          if (table_cache_->KeyMayMatch(f->number, f->file_size, user_key)) {
+            fom.bloom_hit_count++;
+            break;
+          }
+        }
+      }
+      delete mem_iter;
+    }
+  }
+  fom.bloom_hit_ratio = (fom.memtable_key_count > 0)
+      ? static_cast<double>(fom.bloom_hit_count) / fom.memtable_key_count
+      : 0.0;
 
   Status s;
   {
@@ -543,6 +866,33 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   stats.micros = env_->NowMicros() - start_micros;
   stats.bytes_written = meta.file_size;
   stats_[level].Add(stats);
+
+  if (s.ok() && meta.file_size > 0 && twin_env_ == nullptr) {
+    g_io_stats.host_write_bytes += meta.file_size;
+  }
+
+  if (s.ok() && meta.file_size > 0) {
+    fom.new_sst_smallest = meta.smallest.user_key().ToString();
+    fom.new_sst_largest = meta.largest.user_key().ToString();
+    fom.new_sst_size_bytes = meta.file_size;
+    LogFlushOverlapMetrics(fom);
+  }
+
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  CompactionMetrics cm;
+  cm.timestamp_us = static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+  cm.compaction_level = -1;
+  cm.input_bytes = 0;
+  cm.output_bytes = meta.file_size;
+  cm.l0_files_before = versions_->current()->NumFiles(0);
+  cm.l0_files_after = versions_->current()->NumFiles(0);
+  cm.l0_bytes = versions_->NumLevelBytes(0);
+  cm.l1_files_before = versions_->current()->NumFiles(1);
+  cm.l1_files_after = versions_->current()->NumFiles(1);
+  cm.l1_bytes = versions_->NumLevelBytes(1);
+  LogCompactionMetrics(cm);
+
   return s;
 }
 
@@ -550,26 +900,60 @@ void DBImpl::CompactMemTable() {
   mutex_.AssertHeld();
   assert(imm_ != nullptr);
 
-  // Save the contents of the memtable as a new Table
   VersionEdit edit;
-  Version* base = versions_->current();
-  base->Ref();
-  Status s = WriteLevel0Table(imm_, &edit, base);
-  base->Unref();
+  Status s;
+
+  if (options_.enable_pre_l0 && pre_l0_ != nullptr) {
+    s = pre_l0_->FlushMemTable(imm_, imm_log_number_, &edit);
+    if (s.ok()) {
+      edit.SetPrevLogNumber(0);
+      uint64_t safe_log = pre_l0_->MinLogNumber();
+      edit.SetLogNumber(safe_log > 0 ? safe_log : logfile_number_);
+
+      if (!options_.metrics_dir.empty()) {
+        std::string path = options_.metrics_dir + "/wal_gap.csv";
+        FILE* f = std::fopen(path.c_str(), "a");
+        if (f != nullptr) {
+          std::fseek(f, 0, SEEK_END);
+          if (std::ftell(f) == 0) {
+            std::fprintf(f,
+                         "timestamp_us,logfile_number,min_log_number,gap,"
+                         "distinct_live_logs\n");
+          }
+          struct timeval tvg;
+          gettimeofday(&tvg, nullptr);
+          uint64_t now_us =
+              static_cast<uint64_t>(tvg.tv_sec) * 1000000 + tvg.tv_usec;
+          std::fprintf(f, "%llu,%llu,%llu,%llu,%zu\n",
+                       static_cast<unsigned long long>(now_us),
+                       static_cast<unsigned long long>(logfile_number_),
+                       static_cast<unsigned long long>(safe_log),
+                       static_cast<unsigned long long>(logfile_number_ -
+                                                       safe_log),
+                       pre_l0_->DistinctLiveLogs());
+          std::fclose(f);
+        }
+      }
+
+      s = versions_->LogAndApply(&edit, &mutex_);
+    }
+  } else {
+    Version* base = versions_->current();
+    base->Ref();
+    s = WriteLevel0Table(imm_, &edit, base);
+    base->Unref();
+    if (s.ok()) {
+      edit.SetPrevLogNumber(0);
+      edit.SetLogNumber(logfile_number_);
+      s = versions_->LogAndApply(&edit, &mutex_);
+    }
+  }
 
   if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
     s = Status::IOError("Deleting DB during memtable compaction");
   }
 
-  // Replace immutable memtable with the generated Table
   if (s.ok()) {
-    edit.SetPrevLogNumber(0);
-    edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
-    s = versions_->LogAndApply(&edit, &mutex_);
-  }
-
-  if (s.ok()) {
-    // Commit to the new state
     imm_->Unref();
     imm_ = nullptr;
     has_imm_.store(false, std::memory_order_release);
@@ -577,6 +961,143 @@ void DBImpl::CompactMemTable() {
   } else {
     RecordBackgroundError(s);
   }
+}
+
+void DBImpl::BackgroundWalSnapshot() {
+  mutex_.AssertHeld();
+  assert(imm_ == nullptr);
+  if (!(options_.enable_pre_l0 && pre_l0_ != nullptr) ||
+      options_.pre_l0_wal_snapshot_threshold_bytes == 0 ||
+      shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  const uint64_t t_start_us = env_->NowMicros();
+  const uint64_t pre_live_wal_bytes = live_wal_bytes_;
+
+  const SequenceNumber snap_seq = versions_->LastSequence();
+  const uint64_t snapshot_num = versions_->NewFileNumber();
+  Status s = SwitchToNewWAL();
+  if (!s.ok()) {
+    RecordBackgroundError(s);
+    return;
+  }
+  assert(logfile_number_ == snapshot_num + 1 &&
+         "rotation WAL must sort immediately above snapshot_num");
+  const uint64_t imm_log = imm_log_number_;
+
+  Iterator* iter = pre_l0_->NewIterator();
+
+  uint64_t entries_written = 0;
+  mutex_.Unlock();
+  Status ws = WriteWalSnapshotFile(snapshot_num, snap_seq, iter, &entries_written);
+  delete iter;
+  mutex_.Lock();
+
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (!ws.ok()) {
+    RecordBackgroundError(ws);
+    return;
+  }
+
+  pre_l0_->RepointRetentionToSnapshot(snapshot_num);
+  const uint64_t new_floor = std::min(snapshot_num, imm_log);
+  VersionEdit edit;
+  edit.SetPrevLogNumber(0);
+  edit.SetLogNumber(new_floor);
+  s = versions_->LogAndApply(&edit, &mutex_);
+  if (!s.ok()) {
+    RecordBackgroundError(s);
+    return;
+  }
+  RemoveObsoleteFiles();
+
+  uint64_t snap_size = 0;
+  env_->GetFileSize(LogFileName(dbname_, snapshot_num), &snap_size);
+  ++wal_snapshot_count_;
+
+  if (!options_.metrics_dir.empty()) {
+    const uint64_t dur_us = env_->NowMicros() - t_start_us;
+    std::string path = options_.metrics_dir + "/pre_l0_wal_snapshot.csv";
+    FILE* f = std::fopen(path.c_str(), "a");
+    if (f != nullptr) {
+      std::fseek(f, 0, SEEK_END);
+      if (std::ftell(f) == 0) {
+        std::fprintf(f,
+                     "timestamp_us,snapshot_num,snap_seq,new_floor,"
+                     "pre_live_wal_bytes,post_live_wal_bytes,snapshot_file_bytes,"
+                     "entries_written,duration_us\n");
+      }
+      std::fprintf(f, "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                   static_cast<unsigned long long>(t_start_us),
+                   static_cast<unsigned long long>(snapshot_num),
+                   static_cast<unsigned long long>(snap_seq),
+                   static_cast<unsigned long long>(new_floor),
+                   static_cast<unsigned long long>(pre_live_wal_bytes),
+                   static_cast<unsigned long long>(live_wal_bytes_),
+                   static_cast<unsigned long long>(snap_size),
+                   static_cast<unsigned long long>(entries_written),
+                   static_cast<unsigned long long>(dur_us));
+      std::fclose(f);
+    }
+  }
+}
+
+Status DBImpl::WriteWalSnapshotFile(uint64_t snapshot_num,
+                                    SequenceNumber snap_seq, Iterator* iter,
+                                    uint64_t* entries_written) {
+  *entries_written = 0;
+  const std::string tmp = TempFileName(dbname_, snapshot_num);
+  WritableFile* file = nullptr;
+  Status s = env_->NewWritableFile(tmp, &file);
+  if (!s.ok()) {
+    return s;
+  }
+
+  log::Writer writer(file);
+  uint64_t count = 0;
+  for (iter->SeekToFirst(); iter->Valid() && s.ok(); iter->Next()) {
+    ParsedInternalKey ikey;
+    if (!ParseInternalKey(iter->key(), &ikey)) {
+      s = Status::Corruption("pre-L0 WAL snapshot: bad internal key");
+      break;
+    }
+    if (ikey.sequence > snap_seq) {
+      continue;
+    }
+    WriteBatch batch;
+    if (ikey.type == kTypeDeletion) {
+      batch.Delete(ikey.user_key);
+    } else {
+      batch.Put(ikey.user_key, iter->value());
+    }
+    WriteBatchInternal::SetSequence(&batch, ikey.sequence);
+    s = writer.AddRecord(WriteBatchInternal::Contents(&batch));
+    ++count;
+  }
+
+  if (s.ok()) {
+    s = file->Sync();
+  }
+  Status close_s = file->Close();
+  if (s.ok()) {
+    s = close_s;
+  }
+  delete file;
+
+  if (!s.ok()) {
+    env_->RemoveFile(tmp);
+    return s;
+  }
+  s = env_->RenameFile(tmp, LogFileName(dbname_, snapshot_num));
+  if (!s.ok()) {
+    env_->RemoveFile(tmp);
+    return s;
+  }
+  *entries_written = count;
+  return s;
 }
 
 void DBImpl::CompactRange(const Slice* begin, const Slice* end) {
@@ -674,7 +1195,7 @@ void DBImpl::MaybeScheduleCompaction() {
   } else if (!bg_error_.ok()) {
     // Already got an error; no more changes
   } else if (imm_ == nullptr && manual_compaction_ == nullptr &&
-             !versions_->NeedsCompaction()) {
+             !versions_->NeedsCompaction() && !wal_snapshot_requested_) {
     // No work to be done
   } else {
     background_compaction_scheduled_ = true;
@@ -710,6 +1231,12 @@ void DBImpl::BackgroundCompaction() {
 
   if (imm_ != nullptr) {
     CompactMemTable();
+    return;
+  }
+
+  if (wal_snapshot_requested_) {
+    wal_snapshot_requested_ = false;
+    BackgroundWalSnapshot();
     return;
   }
 
@@ -813,6 +1340,7 @@ Status DBImpl::OpenCompactionOutputFile(CompactionState* compact) {
     pending_outputs_.insert(file_number);
     CompactionState::Output out;
     out.number = file_number;
+    out.file_size = 0;
     out.smallest.Clear();
     out.largest.Clear();
     compact->outputs.push_back(out);
@@ -895,6 +1423,122 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
 }
 
+void DBImpl::LogCompactionMetrics(const CompactionMetrics& m) {
+  mutex_.AssertHeld();
+  if (metrics_file_ == nullptr) return;
+  std::fprintf(metrics_file_,
+               "%lld,%d,%lld,%lld,%d,%d,%lld,%d,%d,%lld,%lld,%lld,%lld,%lld\n",
+               static_cast<long long>(m.timestamp_us), m.compaction_level,
+               static_cast<long long>(m.input_bytes),
+               static_cast<long long>(m.output_bytes), m.l0_files_before,
+               m.l0_files_after, static_cast<long long>(m.l0_bytes),
+               m.l1_files_before, m.l1_files_after,
+               static_cast<long long>(m.l1_bytes),
+               static_cast<long long>(m.peak_resident_data_block_bytes),
+               static_cast<long long>(m.peak_resident_data_block_count),
+               static_cast<long long>(m.total_data_block_bytes),
+               static_cast<long long>(m.total_data_block_count));
+  std::fflush(metrics_file_);
+}
+
+void DBImpl::LogFlushHotnessMetrics(const FlushHotnessMetrics& m) {
+  mutex_.AssertHeld();
+  if (flush_hotness_file_ == nullptr) return;
+  std::fprintf(flush_hotness_file_,
+               "%llu,%llu,%llu,%llu,%llu,%.6f,%.6f,%d,%d,%d\n",
+               static_cast<unsigned long long>(m.timestamp_us),
+               static_cast<unsigned long long>(m.flush_seq),
+               static_cast<unsigned long long>(m.total_entries),
+               static_cast<unsigned long long>(m.unique_keys),
+               static_cast<unsigned long long>(m.hot_keys),
+               m.hot_key_ratio, m.hot_byte_ratio,
+               m.max_version_count, m.p50_version_count, m.p90_version_count);
+  std::fflush(flush_hotness_file_);
+}
+
+void DBImpl::LogFlushOverlapMetrics(const FlushOverlapMetrics& m) {
+  mutex_.AssertHeld();
+  if (flush_metrics_file_ == nullptr) return;
+  std::fprintf(flush_metrics_file_, "%llu,%d,%d,%d,%.4f,%s,%s,%llu\n",
+               static_cast<unsigned long long>(m.timestamp_us),
+               m.memtable_key_count, m.l0_file_count, m.bloom_hit_count,
+               m.bloom_hit_ratio, m.new_sst_smallest.c_str(),
+               m.new_sst_largest.c_str(),
+               static_cast<unsigned long long>(m.new_sst_size_bytes));
+  std::fflush(flush_metrics_file_);
+}
+
+void DBImpl::LogWalMetrics(uint64_t wal_number, uint64_t create_time_us,
+                            uint64_t delete_time_us, uint64_t wal_size_bytes) {
+  mutex_.AssertHeld();
+  if (wal_metrics_file_ == nullptr) return;
+  uint64_t lifetime_ms =
+      (delete_time_us >= create_time_us) ? (delete_time_us - create_time_us) / 1000 : 0;
+  std::fprintf(wal_metrics_file_, "%llu,%llu,%llu,%llu,%llu\n",
+               static_cast<unsigned long long>(wal_number),
+               static_cast<unsigned long long>(create_time_us),
+               static_cast<unsigned long long>(delete_time_us),
+               static_cast<unsigned long long>(lifetime_ms),
+               static_cast<unsigned long long>(wal_size_bytes));
+  std::fflush(wal_metrics_file_);
+}
+
+void DBImpl::SnapshotWalFootprint(const std::vector<std::string>& filenames) {
+  mutex_.AssertHeld();
+  if (wal_footprint_file_ == nullptr) return;
+
+  const uint64_t oldest_retained_log = versions_->LogNumber();
+  const uint64_t prev_log_number = versions_->PrevLogNumber();
+  uint64_t retained_wal_count = 0;
+  uint64_t retained_wal_bytes = 0;
+  uint64_t number;
+  FileType type;
+  for (const std::string& filename : filenames) {
+    if (ParseFileName(filename, &number, &type) && type == kLogFile &&
+        ((number >= oldest_retained_log) || (number == prev_log_number))) {
+      uint64_t size_bytes = 0;
+      env_->GetFileSize(dbname_ + "/" + filename, &size_bytes);
+      retained_wal_count++;
+      retained_wal_bytes += size_bytes;
+    }
+  }
+
+  const uint64_t log_gap = (logfile_number_ >= oldest_retained_log)
+                               ? (logfile_number_ - oldest_retained_log)
+                               : 0;
+  std::fprintf(wal_footprint_file_, "%llu,%llu,%llu,%llu,%llu,%llu\n",
+               static_cast<unsigned long long>(env_->NowMicros()),
+               static_cast<unsigned long long>(retained_wal_count),
+               static_cast<unsigned long long>(retained_wal_bytes),
+               static_cast<unsigned long long>(oldest_retained_log),
+               static_cast<unsigned long long>(logfile_number_),
+               static_cast<unsigned long long>(log_gap));
+  std::fflush(wal_footprint_file_);
+}
+
+void DBImpl::LogUserWriteBytes(uint64_t batch_bytes) {
+  mutex_.AssertHeld();
+  user_write_bytes_ += batch_bytes;
+}
+
+void DBImpl::EnableKeyAccessTracking() {
+  MutexLock l(&mutex_);
+  key_access_map_.clear();
+}
+
+void DBImpl::DumpKeyAccessStats() {
+  mutex_.AssertHeld();
+  if (key_access_file_ == nullptr) return;
+  for (const auto& [key, stats] : key_access_map_) {
+    std::fprintf(key_access_file_, "%s,%llu,%llu,%llu\n", key.c_str(),
+                 static_cast<unsigned long long>(stats.read_count),
+                 static_cast<unsigned long long>(stats.write_count),
+                 static_cast<unsigned long long>(stats.read_count +
+                                                 stats.write_count));
+  }
+  std::fflush(key_access_file_);
+}
+
 Status DBImpl::DoCompactionWork(CompactionState* compact) {
   const uint64_t start_micros = env_->NowMicros();
   int64_t imm_micros = 0;  // Micros spent doing imm_ compactions
@@ -918,8 +1562,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   // Release mutex while we're actually doing the compaction work
   mutex_.Unlock();
 
-  input->SeekToFirst();
   Status status;
+  {
+    IoClassScope io_scope(IoClass::kCompaction);
+
+    g_data_block_ws.ResetPeak();
+
+    input->SeekToFirst();
   ParsedInternalKey ikey;
   std::string current_user_key;
   bool has_current_user_key = false;
@@ -1030,6 +1679,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   }
   delete input;
   input = nullptr;
+  }
 
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
@@ -1042,8 +1692,16 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
 
+  if (twin_env_ == nullptr) {
+    g_io_stats.host_read_bytes += stats.bytes_read;
+    g_io_stats.host_write_bytes += stats.bytes_written;
+  }
+
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
+
+  const int l0_before = versions_->current()->NumFiles(0);
+  const int l1_before = versions_->current()->NumFiles(1);
 
   if (status.ok()) {
     status = InstallCompactionResults(compact);
@@ -1051,6 +1709,30 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   if (!status.ok()) {
     RecordBackgroundError(status);
   }
+
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  CompactionMetrics cm;
+  cm.timestamp_us = static_cast<int64_t>(tv.tv_sec) * 1000000 + tv.tv_usec;
+  cm.compaction_level = compact->compaction->level();
+  cm.input_bytes = stats.bytes_read;
+  cm.output_bytes = stats.bytes_written;
+  cm.l0_files_before = l0_before;
+  cm.l0_files_after = versions_->current()->NumFiles(0);
+  cm.l0_bytes = versions_->NumLevelBytes(0);
+  cm.l1_files_before = l1_before;
+  cm.l1_files_after = versions_->current()->NumFiles(1);
+  cm.l1_bytes = versions_->NumLevelBytes(1);
+  cm.peak_resident_data_block_bytes =
+      static_cast<int64_t>(g_data_block_ws.peak_bytes.load());
+  cm.peak_resident_data_block_count =
+      static_cast<int64_t>(g_data_block_ws.peak_count.load());
+  cm.total_data_block_bytes =
+      static_cast<int64_t>(g_data_block_ws.total_bytes.load());
+  cm.total_data_block_count =
+      static_cast<int64_t>(g_data_block_ws.total_count.load());
+  LogCompactionMetrics(cm);
+
   VersionSet::LevelSummaryStorage tmp;
   Log(options_.info_log, "compacted to: %s", versions_->LevelSummary(&tmp));
   return status;
@@ -1094,6 +1776,9 @@ Iterator* DBImpl::NewInternalIterator(const ReadOptions& options,
     list.push_back(imm_->NewIterator());
     imm_->Ref();
   }
+  if (options_.enable_pre_l0 && pre_l0_ != nullptr) {
+    list.push_back(pre_l0_->NewIterator());
+  }
   versions_->current()->AddIterators(options, &list);
   Iterator* internal_iter =
       NewMergingIterator(&internal_comparator_, &list[0], list.size());
@@ -1116,6 +1801,38 @@ Iterator* DBImpl::TEST_NewInternalIterator() {
 int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes() {
   MutexLock l(&mutex_);
   return versions_->MaxNextLevelOverlappingBytes();
+}
+
+uint64_t DBImpl::TEST_PreL0LinkValueBytes() {
+  MutexLock l(&mutex_);
+  return pre_l0_ != nullptr ? pre_l0_->LinkValueBytes() : 0;
+}
+
+uint64_t DBImpl::TEST_PreL0MinLogNumber() {
+  MutexLock l(&mutex_);
+  return pre_l0_ != nullptr ? pre_l0_->MinLogNumber() : 0;
+}
+
+Status DBImpl::TEST_TriggerWalSnapshot() {
+  MutexLock l(&mutex_);
+  const uint64_t before = wal_snapshot_count_;
+  wal_snapshot_requested_ = true;
+  MaybeScheduleCompaction();
+  while (wal_snapshot_count_ == before && bg_error_.ok() &&
+         !shutting_down_.load(std::memory_order_acquire)) {
+    background_work_finished_signal_.Wait();
+  }
+  return bg_error_;
+}
+
+uint64_t DBImpl::TEST_LiveWalBytes() {
+  MutexLock l(&mutex_);
+  return live_wal_bytes_;
+}
+
+uint64_t DBImpl::TEST_WalSnapshotCount() {
+  MutexLock l(&mutex_);
+  return wal_snapshot_count_;
 }
 
 Status DBImpl::Get(const ReadOptions& options, const Slice& key,
@@ -1149,6 +1866,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
       // Done
     } else if (imm != nullptr && imm->Get(lkey, value, &s)) {
       // Done
+    } else if (options_.enable_pre_l0 && pre_l0_ != nullptr &&
+               pre_l0_->Get(lkey, value, &s)) {
+      // Done
     } else {
       s = current->Get(options, lkey, value, &stats);
       have_stat_update = true;
@@ -1158,6 +1878,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
 
   if (have_stat_update && current->UpdateStats(stats)) {
     MaybeScheduleCompaction();
+  }
+  if (key_access_file_ != nullptr) {
+    key_access_map_[key.ToString()].read_count++;
   }
   mem->Unref();
   if (imm != nullptr) imm->Unref();
@@ -1231,6 +1954,8 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
+    const uint64_t wal_append_number = logfile_number_;
+    const uint64_t wal_append_bytes = WriteBatchInternal::ByteSize(write_batch);
     {
       mutex_.Unlock();
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
@@ -1245,12 +1970,32 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
       mutex_.Lock();
+      if (status.ok()) {
+        AddWalBytes(wal_append_number, wal_append_bytes);
+      }
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
         // So we force the DB into a mode where all future writes fail.
         RecordBackgroundError(status);
       }
+    }
+    if (status.ok()) {
+      LogUserWriteBytes(WriteBatchInternal::ByteSize(updates));
+    }
+    if (status.ok() && key_access_file_ != nullptr) {
+      struct KeyCounter : public WriteBatch::Handler {
+        std::unordered_map<std::string, KeyAccessStats>* map;
+        void Put(const Slice& key, const Slice&) override {
+          (*map)[key.ToString()].write_count++;
+        }
+        void Delete(const Slice& key) override {
+          (*map)[key.ToString()].write_count++;
+        }
+      };
+      KeyCounter counter;
+      counter.map = &key_access_map_;
+      write_batch->Iterate(&counter);
     }
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
 
@@ -1328,6 +2073,50 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
 
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
+Status DBImpl::SwitchToNewWAL() {
+  mutex_.AssertHeld();
+  assert(versions_->PrevLogNumber() == 0);
+  assert(imm_ == nullptr);
+  uint64_t new_log_number = versions_->NewFileNumber();
+  WritableFile* lfile = nullptr;
+  Status s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+  if (!s.ok()) {
+    // Avoid chewing through file number space in a tight loop.
+    versions_->ReuseFileNumber(new_log_number);
+    return s;
+  }
+
+  delete log_;
+
+  Status close_status = logfile_->Close();
+  if (!close_status.ok()) {
+    // We may have lost some data written to the previous log file. Switch to
+    // the new log file anyway, but record as a background error so we do not
+    // attempt any more writes.
+    //
+    // We could perhaps attempt to save the memtable corresponding to log file
+    // and suppress the error if that works, but that would add more complexity
+    // in a critical code path.
+    RecordBackgroundError(close_status);
+  }
+  delete logfile_;
+
+  logfile_ = lfile;
+  if (options_.enable_pre_l0) {
+    imm_log_number_ = logfile_number_;
+  }
+  logfile_number_ = new_log_number;
+  wal_create_times_[new_log_number] = env_->NowMicros();
+  wal_bytes_[new_log_number] = 0;
+  log_ = new log::Writer(lfile);
+  imm_ = mem_;
+  has_imm_.store(true, std::memory_order_release);
+  mem_ = new MemTable(internal_comparator_);
+  mem_->Ref();
+  MaybeScheduleCompaction();
+  return s;
+}
+
 Status DBImpl::MakeRoomForWrite(bool force) {
   mutex_.AssertHeld();
   assert(!writers_.empty());
@@ -1365,40 +2154,17 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       background_work_finished_signal_.Wait();
     } else {
       // Attempt to switch to a new memtable and trigger compaction of old
-      assert(versions_->PrevLogNumber() == 0);
-      uint64_t new_log_number = versions_->NewFileNumber();
-      WritableFile* lfile = nullptr;
-      s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+      s = SwitchToNewWAL();
       if (!s.ok()) {
-        // Avoid chewing through file number space in a tight loop.
-        versions_->ReuseFileNumber(new_log_number);
         break;
       }
-
-      delete log_;
-
-      s = logfile_->Close();
-      if (!s.ok()) {
-        // We may have lost some data written to the previous log file.
-        // Switch to the new log file anyway, but record as a background
-        // error so we do not attempt any more writes.
-        //
-        // We could perhaps attempt to save the memtable corresponding
-        // to log file and suppress the error if that works, but that
-        // would add more complexity in a critical code path.
-        RecordBackgroundError(s);
-      }
-      delete logfile_;
-
-      logfile_ = lfile;
-      logfile_number_ = new_log_number;
-      log_ = new log::Writer(lfile);
-      imm_ = mem_;
-      has_imm_.store(true, std::memory_order_release);
-      mem_ = new MemTable(internal_comparator_);
-      mem_->Ref();
       force = false;  // Do not force another compaction if have room
-      MaybeScheduleCompaction();
+
+      if (options_.enable_pre_l0 &&
+          wal_snapshot_trigger_.ShouldTrigger(live_wal_bytes_)) {
+        wal_snapshot_requested_ = true;
+        MaybeScheduleCompaction();
+      }
     }
   }
   return s;
@@ -1503,7 +2269,36 @@ DB::~DB() = default;
 Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
   *dbptr = nullptr;
 
-  DBImpl* impl = new DBImpl(options, dbname);
+  Options open_options = options;
+  LatencyInjector* inner_injector = nullptr;
+  LatencyInjector* host_read_stream = nullptr;
+  LatencyInjector* host_read_random = nullptr;
+  LatencyInjector* host_write = nullptr;
+  TwinEnv* twin_env = nullptr;
+  if (options.enable_pre_l0 || options.enable_cxl_compaction ||
+      options.enable_host_model) {
+    inner_injector = new LatencyInjector();
+    inner_injector->Init(options.pre_l0_inner_bps, options.pre_l0_inner_fixed_ns);
+
+    host_read_stream = new LatencyInjector();
+    host_read_stream->Init(options.pre_l0_host_read_bps, 0.0);
+    host_read_random = new LatencyInjector();
+    host_read_random->Init(options.pre_l0_host_read_bps, options.pre_l0_host_fixed_ns);
+    host_write = new LatencyInjector();
+    host_write->Init(options.pre_l0_host_write_bps, 0.0);
+
+    twin_env = new TwinEnv(options.env, inner_injector,
+                           host_read_stream, host_read_random, host_write,
+                           options.enable_cxl_compaction);
+    open_options.env = twin_env;
+  }
+
+  DBImpl* impl = new DBImpl(open_options, dbname);
+  impl->twin_env_ = twin_env;
+  impl->inner_injector_ = inner_injector;
+  impl->host_read_stream_injector_ = host_read_stream;
+  impl->host_read_random_injector_ = host_read_random;
+  impl->host_write_injector_ = host_write;
   impl->mutex_.Lock();
   VersionEdit edit;
   // Recover handles create_if_missing, error_if_exists
@@ -1519,6 +2314,8 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
       edit.SetLogNumber(new_log_number);
       impl->logfile_ = lfile;
       impl->logfile_number_ = new_log_number;
+      impl->wal_create_times_[new_log_number] = impl->env_->NowMicros();
+      impl->wal_bytes_[new_log_number] = 0;
       impl->log_ = new log::Writer(lfile);
       impl->mem_ = new MemTable(impl->internal_comparator_);
       impl->mem_->Ref();
@@ -1528,6 +2325,12 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
     edit.SetPrevLogNumber(0);  // No older logs needed after recovery.
     edit.SetLogNumber(impl->logfile_number_);
     s = impl->versions_->LogAndApply(&edit, &impl->mutex_);
+  }
+  if (s.ok() && options.enable_pre_l0) {
+    impl->pre_l0_ = new PreL0Manager(open_options, dbname, impl->env_,
+                                     impl->table_cache_, impl->versions_,
+                                     &impl->mutex_);
+    s = impl->pre_l0_->Recover();
   }
   if (s.ok()) {
     impl->RemoveObsoleteFiles();

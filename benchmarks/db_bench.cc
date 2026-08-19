@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "db/io_stats.h"
+#include "db/pre_l0/io_context.h"
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
 #include "leveldb/db.h"
@@ -126,8 +128,31 @@ static bool FLAGS_compression = true;
 // Use the db with the following name.
 static const char* FLAGS_db = nullptr;
 
+static const char* FLAGS_metrics_dir = "/mnt/hdd/tmp";
+
 // ZSTD compression level to try out
 static int FLAGS_zstd_compression_level = 1;
+
+static bool FLAGS_enable_pre_l0 = false;
+
+static int FLAGS_pre_l0_cxl_size_mb = 256;
+
+static bool FLAGS_enable_cxl_compaction = false;
+
+static bool FLAGS_enable_host_model = false;
+
+static bool FLAGS_enable_wal_footprint_tracking = false;
+
+static bool FLAGS_pre_l0_fallback_to_l0 = true;
+
+static int FLAGS_pre_l0_hot_threshold = 2;
+
+static double FLAGS_pre_l0_evict_high_watermark = 0.80;
+static double FLAGS_pre_l0_evict_low_watermark = 0.60;
+
+static int FLAGS_pre_l0_wal_snapshot_threshold_mb = 2048;
+
+static double FLAGS_zipfian_theta = 0.99;
 
 namespace leveldb {
 
@@ -211,6 +236,53 @@ class KeyBuffer {
 
  private:
   char buffer_[1024];
+};
+
+class ZipfianGenerator {
+ public:
+  explicit ZipfianGenerator(int n, double theta = 0.99)
+      : n_(n),
+        theta_(theta),
+        alpha_(1.0 / (1.0 - theta)),
+        zetan_(Zeta(n, theta)),
+        eta_((1 - std::pow(2.0 / n, 1 - theta)) /
+             (1 - Zeta(2, theta) / zetan_)) {}
+
+  int Next(Random* rng) {
+    double u = (rng->Next() % 1000000) / 1000000.0;
+    double uz = u * zetan_;
+    int k;
+    if (uz < 1.0) {
+      k = 0;
+    } else if (uz < 1.0 + std::pow(0.5, theta_)) {
+      k = 1;
+    } else {
+      k = static_cast<int>(n_ * std::pow(eta_ * u - eta_ + 1, alpha_));
+    }
+    return Scramble(k);
+  }
+
+ private:
+  int Scramble(int k) const {
+    uint64_t hashval = 0xCBF29CE484222325ULL;
+    uint64_t v = static_cast<uint64_t>(static_cast<uint32_t>(k));
+    for (int i = 0; i < 8; i++) {
+      hashval ^= (v & 0xff);
+      hashval *= 0x100000001B3ULL;
+      v >>= 8;
+    }
+    int64_t signed_hash = static_cast<int64_t>(hashval);
+    if (signed_hash < 0) signed_hash = -signed_hash;
+    return static_cast<int>(signed_hash % n_);
+  }
+
+  static double Zeta(int n, double theta) {
+    double sum = 0.0;
+    for (int i = 1; i <= n; i++) sum += 1.0 / std::pow(i, theta);
+    return sum;
+  }
+  int n_;
+  double theta_, alpha_, zetan_, eta_;
 };
 
 #if defined(__linux)
@@ -338,6 +410,55 @@ class Stats {
       std::fprintf(stdout, "Microseconds per op:\n%s\n",
                    hist_.ToString().c_str());
     }
+    std::fflush(stdout);
+
+    if (FLAGS_histogram && FLAGS_metrics_dir && FLAGS_metrics_dir[0] != '\0') {
+      std::string path = std::string(FLAGS_metrics_dir) +
+                         "/latency_percentiles.csv";
+      FILE* f = std::fopen(path.c_str(), "w");
+      if (f != nullptr) {
+        std::fprintf(f,
+                     "benchmark,op_count,min_us,p50_us,avg_us,p95_us,p99_us,"
+                     "p999_us,max_us,stddev_us\n");
+        std::fprintf(f, "%s,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                     name.ToString().c_str(), hist_.Count(), hist_.Min(),
+                     hist_.Median(), hist_.Average(), hist_.Percentile(95.0),
+                     hist_.Percentile(99.0), hist_.Percentile(99.9),
+                     hist_.Max(), hist_.StandardDeviation());
+        std::fclose(f);
+      }
+    }
+  }
+
+  void PrintIOStats() const {
+    auto& s = leveldb::g_io_stats;
+    auto mb = [](uint64_t b) { return b / (1024.0 * 1024.0); };
+
+    double elapsed_sec = seconds_;
+    if (elapsed_sec <= 0) return;
+
+    std::fprintf(stdout, "--- IO Traffic ---\n");
+    std::fprintf(stdout, "  host_write_bytes  : %.1f MB\n",
+                 mb(s.host_write_bytes.load()));
+    std::fprintf(stdout, "  cxl_write_bytes   : %.1f MB\n",
+                 mb(s.cxl_write_bytes.load()));
+    std::fprintf(stdout, "  host_read_bytes   : %.1f MB\n",
+                 mb(s.host_read_bytes.load()));
+    std::fprintf(stdout, "  cxl_read_bytes    : %.1f MB\n",
+                 mb(s.cxl_read_bytes.load()));
+    std::fprintf(stdout, "  prel0_write_bytes : %.1f MB\n",
+                 mb(s.prel0_write_bytes.load()));
+    std::fprintf(stdout, "\n");
+
+    uint64_t host_io = s.HostVisibleIO();
+    uint64_t ssd_io = s.SSDInternalIO();
+    std::fprintf(stdout, "  Host-visible IO   : %.1f MB\n", mb(host_io));
+    std::fprintf(stdout, "  SSD-internal IO   : %.1f MB\n", mb(ssd_io));
+    std::fprintf(stdout, "  Saved vs baseline : %.1f MB\n", mb(ssd_io));
+    std::fprintf(stdout, "\n");
+
+    std::fprintf(stdout, "--- Throughput ---\n");
+    std::fprintf(stdout, "  ops/sec (measured) : %.0f\n", done_ / elapsed_sec);
     std::fflush(stdout);
   }
 };
@@ -593,6 +714,22 @@ class Benchmark {
       } else if (name == Slice("overwrite")) {
         fresh_db = false;
         method = &Benchmark::WriteRandom;
+      } else if (name == Slice("writezipfian")) {
+        fresh_db = false;
+        method = &Benchmark::WriteZipfian;
+      } else if (name == Slice("writezipfiansync")) {
+        fresh_db = false;
+        write_options_.sync = true;
+        method = &Benchmark::WriteZipfian;
+      } else if (name == Slice("resetkeytracking")) {
+        if (db_ != nullptr) {
+          db_->EnableKeyAccessTracking();
+          std::fprintf(stdout, "%-12s : key_access_map cleared\n",
+                       name.ToString().c_str());
+        }
+      } else if (name == Slice("ycsba")) {
+        fresh_db = false;
+        method = &Benchmark::YcsbA;
       } else if (name == Slice("fillsync")) {
         fresh_db = true;
         num_ /= 1000;
@@ -709,6 +846,7 @@ class Benchmark {
 
   void RunBenchmark(int n, Slice name,
                     void (Benchmark::*method)(ThreadState*)) {
+    leveldb::g_io_stats.Reset();
     SharedState shared(n);
 
     ThreadArg* arg = new ThreadArg[n];
@@ -741,6 +879,7 @@ class Benchmark {
       arg[0].thread->stats.Merge(arg[i].thread->stats);
     }
     arg[0].thread->stats.Report(name);
+    arg[0].thread->stats.PrintIOStats();
     if (FLAGS_comparisons) {
       fprintf(stdout, "Comparisons: %zu\n", count_comparator_.comparisons());
       count_comparator_.reset();
@@ -814,6 +953,20 @@ class Benchmark {
     options.max_open_files = FLAGS_open_files;
     options.filter_policy = filter_policy_;
     options.reuse_logs = FLAGS_reuse_logs;
+    options.metrics_dir = FLAGS_metrics_dir ? FLAGS_metrics_dir : "";
+    options.enable_wal_footprint_tracking = FLAGS_enable_wal_footprint_tracking;
+    options.enable_pre_l0 = FLAGS_enable_pre_l0;
+    options.pre_l0_cxl_size =
+        static_cast<size_t>(FLAGS_pre_l0_cxl_size_mb) * 1024 * 1024;
+    options.enable_cxl_compaction = FLAGS_enable_cxl_compaction;
+    options.enable_host_model = FLAGS_enable_host_model;
+    options.pre_l0_fallback_to_l0 = FLAGS_pre_l0_fallback_to_l0;
+    options.pre_l0_hot_threshold = FLAGS_pre_l0_hot_threshold;
+    options.pre_l0_evict_high_watermark = FLAGS_pre_l0_evict_high_watermark;
+    options.pre_l0_evict_low_watermark = FLAGS_pre_l0_evict_low_watermark;
+    options.pre_l0_wal_snapshot_threshold_bytes =
+        static_cast<uint64_t>(FLAGS_pre_l0_wal_snapshot_threshold_mb) * 1024 *
+        1024;
     options.compression =
         FLAGS_compression ? kSnappyCompression : kNoCompression;
     Status s = DB::Open(options, FLAGS_db, &db_);
@@ -865,7 +1018,63 @@ class Benchmark {
     thread->stats.AddBytes(bytes);
   }
 
+  void WriteZipfian(ThreadState* thread) {
+    RandomGenerator gen;
+    WriteBatch batch;
+    Status s;
+    int64_t bytes = 0;
+    KeyBuffer key;
+    ZipfianGenerator zipf(FLAGS_num, FLAGS_zipfian_theta);
+
+    for (int i = 0; i < num_; i += entries_per_batch_) {
+      batch.Clear();
+      for (int j = 0; j < entries_per_batch_; j++) {
+        const int k = zipf.Next(&thread->rand);
+        key.Set(k);
+        batch.Put(key.slice(), gen.Generate(value_size_));
+        bytes += value_size_ + key.slice().size();
+        thread->stats.FinishedSingleOp();
+      }
+      s = db_->Write(write_options_, &batch);
+      if (!s.ok()) {
+        std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+        std::exit(1);
+      }
+    }
+    thread->stats.AddBytes(bytes);
+  }
+
+  void YcsbA(ThreadState* thread) {
+    ReadOptions roptions;
+    RandomGenerator gen;
+    std::string value;
+    KeyBuffer key;
+    ZipfianGenerator zipf(FLAGS_num, FLAGS_zipfian_theta);
+    int found = 0;
+
+    for (int i = 0; i < num_; i++) {
+      const double r = thread->rand.Uniform(1000000) / 1000000.0;
+      key.Set(zipf.Next(&thread->rand));
+
+      if (r < 0.5) {
+        if (db_->Get(roptions, key.slice(), &value).ok()) found++;
+      } else {
+        Status s =
+            db_->Put(write_options_, key.slice(), gen.Generate(value_size_));
+        if (!s.ok()) {
+          std::fprintf(stderr, "put error: %s\n", s.ToString().c_str());
+          std::exit(1);
+        }
+      }
+      thread->stats.FinishedSingleOp();
+    }
+    char msg[100];
+    std::snprintf(msg, sizeof(msg), "(%d of %d found)", found, num_);
+    thread->stats.AddMessage(msg);
+  }
+
   void ReadSequential(ThreadState* thread) {
+    IoClassScope scan_scope(IoClass::kScan);
     Iterator* iter = db_->NewIterator(ReadOptions());
     int i = 0;
     int64_t bytes = 0;
@@ -879,6 +1088,7 @@ class Benchmark {
   }
 
   void ReadReverse(ThreadState* thread) {
+    IoClassScope scan_scope(IoClass::kScan);
     Iterator* iter = db_->NewIterator(ReadOptions());
     int i = 0;
     int64_t bytes = 0;
@@ -1117,6 +1327,40 @@ int main(int argc, char** argv) {
       FLAGS_open_files = n;
     } else if (strncmp(argv[i], "--db=", 5) == 0) {
       FLAGS_db = argv[i] + 5;
+    } else if (strncmp(argv[i], "--metrics_dir=", 14) == 0) {
+      FLAGS_metrics_dir = argv[i] + 14;
+    } else if (strncmp(argv[i], "--enable_pre_l0=", 16) == 0) {
+      const char* val = argv[i] + 16;
+      FLAGS_enable_pre_l0 = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (sscanf(argv[i], "--pre_l0_cxl_size_mb=%d%c", &n, &junk) == 1) {
+      FLAGS_pre_l0_cxl_size_mb = n;
+    } else if (strncmp(argv[i], "--enable_cxl_compaction=", 24) == 0) {
+      const char* val = argv[i] + 24;
+      FLAGS_enable_cxl_compaction =
+          (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (strncmp(argv[i], "--enable_host_model=", 20) == 0) {
+      const char* val = argv[i] + 20;
+      FLAGS_enable_host_model =
+          (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (strncmp(argv[i], "--enable_wal_footprint_tracking=", 32) == 0) {
+      const char* val = argv[i] + 32;
+      FLAGS_enable_wal_footprint_tracking =
+          (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (strncmp(argv[i], "--pre_l0_fallback_to_l0=", 24) == 0) {
+      const char* val = argv[i] + 24;
+      FLAGS_pre_l0_fallback_to_l0 =
+          (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    } else if (sscanf(argv[i], "--pre_l0_hot_threshold=%d%c", &n, &junk) == 1) {
+      FLAGS_pre_l0_hot_threshold = n;
+    } else if (strncmp(argv[i], "--pre_l0_evict_high_watermark=", 30) == 0) {
+      FLAGS_pre_l0_evict_high_watermark = atof(argv[i] + 30);
+    } else if (strncmp(argv[i], "--pre_l0_evict_low_watermark=", 29) == 0) {
+      FLAGS_pre_l0_evict_low_watermark = atof(argv[i] + 29);
+    } else if (sscanf(argv[i], "--pre_l0_wal_snapshot_threshold_mb=%d%c", &n,
+                      &junk) == 1) {
+      FLAGS_pre_l0_wal_snapshot_threshold_mb = n;
+    } else if (sscanf(argv[i], "--zipfian_theta=%lf%c", &d, &junk) == 1) {
+      FLAGS_zipfian_theta = d;
     } else {
       std::fprintf(stderr, "Invalid flag '%s'\n", argv[i]);
       std::exit(1);

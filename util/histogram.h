@@ -20,13 +20,17 @@ class Histogram {
 
   std::string ToString() const;
 
- private:
-  enum { kNumBuckets = 154 };
-
   double Median() const;
   double Percentile(double p) const;
   double Average() const;
   double StandardDeviation() const;
+
+  double Min() const { return min_; }
+  double Max() const { return max_; }
+  double Count() const { return num_; }
+
+ private:
+  enum { kNumBuckets = 154 };
 
   static const double kBucketLimit[kNumBuckets];
 

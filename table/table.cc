@@ -4,6 +4,7 @@
 
 #include "leveldb/table.h"
 
+#include "db/pre_l0/io_context.h"
 #include "leveldb/cache.h"
 #include "leveldb/comparator.h"
 #include "leveldb/env.h"
@@ -177,6 +178,9 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
         s = ReadBlock(table->rep_->file, options, handle, &contents);
         if (s.ok()) {
           block = new Block(contents);
+          if (CurrentIoClass() == IoClass::kCompaction) {
+            block->AccountCompactionDataBlock();
+          }
           if (contents.cachable && options.fill_cache) {
             cache_handle = block_cache->Insert(key, block, block->size(),
                                                &DeleteCachedBlock);
@@ -187,6 +191,9 @@ Iterator* Table::BlockReader(void* arg, const ReadOptions& options,
       s = ReadBlock(table->rep_->file, options, handle, &contents);
       if (s.ok()) {
         block = new Block(contents);
+        if (CurrentIoClass() == IoClass::kCompaction) {
+          block->AccountCompactionDataBlock();
+        }
       }
     }
   }
@@ -209,6 +216,27 @@ Iterator* Table::NewIterator(const ReadOptions& options) const {
   return NewTwoLevelIterator(
       rep_->index_block->NewIterator(rep_->options.comparator),
       &Table::BlockReader, const_cast<Table*>(this), options);
+}
+
+bool Table::BloomKeyMayMatch(const Slice& k) {
+  Iterator* iiter = rep_->index_block->NewIterator(rep_->options.comparator);
+  iiter->Seek(k);
+  bool result;
+  if (!iiter->Valid()) {
+    result = false;
+  } else {
+    FilterBlockReader* filter = rep_->filter;
+    if (filter == nullptr) {
+      result = false;
+    } else {
+      Slice handle_value = iiter->value();
+      BlockHandle handle;
+      result = !handle.DecodeFrom(&handle_value).ok() ||
+               filter->KeyMayMatch(handle.offset(), k);
+    }
+  }
+  delete iiter;
+  return result;
 }
 
 Status Table::InternalGet(const ReadOptions& options, const Slice& k, void* arg,

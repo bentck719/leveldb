@@ -111,6 +111,18 @@ Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
   return s;
 }
 
+bool TableCache::KeyMayMatch(uint64_t file_number, uint64_t file_size,
+                              const Slice& user_key) {
+  Cache::Handle* handle = nullptr;
+  Status s = FindTable(file_number, file_size, &handle);
+  if (!s.ok()) return true;
+  Table* t = reinterpret_cast<TableAndFile*>(cache_->Value(handle))->table;
+  LookupKey lkey(user_key, kMaxSequenceNumber);
+  bool result = t->BloomKeyMayMatch(lkey.internal_key());
+  cache_->Release(handle);
+  return result;
+}
+
 void TableCache::Evict(uint64_t file_number) {
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);

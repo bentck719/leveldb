@@ -76,6 +76,8 @@ class LEVELDB_EXPORT Table {
   void ReadMeta(const Footer& footer);
   void ReadFilter(const Slice& filter_handle_value);
 
+  bool BloomKeyMayMatch(const Slice& k);
+
   Rep* const rep_;
 };
 

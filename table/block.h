@@ -28,6 +28,8 @@ class Block {
   size_t size() const { return size_; }
   Iterator* NewIterator(const Comparator* comparator);
 
+  void AccountCompactionDataBlock();
+
  private:
   class Iter;
 
@@ -37,6 +39,7 @@ class Block {
   size_t size_;
   uint32_t restart_offset_;  // Offset in data_ of restart array
   bool owned_;               // Block owns data_[]
+  bool ws_counted_ = false;
 };
 
 }  // namespace leveldb

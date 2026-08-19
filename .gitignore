@@ -5,4 +5,17 @@
 
 # Build directory.
 build/
+build_debug/
+build_prof/
+build_release/
+build_rescue/
 out/
+
+# Benchmark scratch / caches (run_benchmark.py).
+metrics/
+golden_*/
+
+run_benchmark.sh
+*.pyc
+
+__pycache__

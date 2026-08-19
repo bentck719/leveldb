@@ -47,6 +47,9 @@ class TableCache {
   // Evict any entry for the specified file number
   void Evict(uint64_t file_number);
 
+  bool KeyMayMatch(uint64_t file_number, uint64_t file_size,
+                   const Slice& user_key);
+
  private:
   Status FindTable(uint64_t file_number, uint64_t file_size, Cache::Handle**);
 
